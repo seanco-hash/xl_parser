@@ -120,7 +120,7 @@ def read_all_clear_dup(path):
 
 def main():
     input_path = sys.argv[1]
-    output_path = sys.argv[2]
+    # output_path = sys.argv[2]
     read_all_clear_dup(input_path)
     # create_fasta_dict(input_path)
 
