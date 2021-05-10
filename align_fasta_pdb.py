@@ -8,6 +8,7 @@ from Bio.PDB.PDBParser import PDBParser
 from Bio import Align
 from os import listdir
 from os.path import isfile, join
+import numpy as np
 
 # TODO: Update to real indexes, update the xl reader to include residue positions
 UNI_A = 2
@@ -15,6 +16,10 @@ UNI_B = 6
 POS_RES_A = 3
 POS_RES_B = 7
 CONSERVED_AA = {'K', 'R', 'Q', 'E'}
+DIFFERENT_CHAINS = -1
+INVALID_SEQ = -1
+INVALID_XL_POS = -2
+SUCCESS = 1
 
 
 # TODO: run to download missing pdb files
@@ -44,6 +49,52 @@ def get_pdb_files(xl_list, wanted_format="pdb"):
             if name not in already_downloaded:
                 pdb1.retrieve_pdb_file(name, pdir="./pdbs", overwrite=False, file_format=wanted_format)
                 already_downloaded.add(name)
+
+
+def write_single_ali(uni_code, seq, pos_a, pos_b, errors_file):
+    if len(seq) < 1:
+        errors_file.write(uni_code + '\n')
+        return INVALID_SEQ
+    if int(pos_a) >= len(seq) or int(pos_b) >= len(seq):
+        return INVALID_XL_POS
+    file_name = 'ali_files\\' + uni_code + '.ali'
+    f_out = open(file_name, 'w')
+    f_out.write(">P1;" + uni_code + '\n')
+    f_out.write("sequence:" + uni_code + '::::::::' + '\n')
+    f_out.write(seq + '*' + '\n')
+    f_out.write('\n')
+    f_out.write('>P1;_fix_pos\n')
+    f_out.write('sequence:x: :: :: : :-1.00:-1.00\n')
+    arr = ['0' for i in range(len(seq))]
+    arr[int(pos_a)-1] = '4'
+    if pos_b != DIFFERENT_CHAINS:
+        arr[int(pos_b)-1] = '4'
+    s = "".join(arr)
+    f_out.write(s + '*' + '\n')
+    f_out.close()
+    return SUCCESS
+
+
+def write_ali_files(fasta_dict, xl_list):
+    f = open('bad_samples.txt', 'w')
+    already_created = set()
+    for sample in xl_list:
+        if sample[UNI_A] not in already_created:
+            if sample[UNI_A] != sample[UNI_B]:
+                res = write_single_ali(sample[UNI_A], fasta_dict[sample[UNI_A]], sample[POS_RES_A],
+                                 DIFFERENT_CHAINS, f)
+            else:
+                res = write_single_ali(sample[UNI_A], fasta_dict[sample[UNI_A]], sample[POS_RES_A],
+                                 sample[POS_RES_B], f)
+            if res != INVALID_XL_POS:
+                already_created.add(sample[UNI_A])
+        if sample[UNI_A] != sample[UNI_B] and sample[UNI_B] not in already_created:
+            res = write_single_ali(sample[UNI_B], fasta_dict[sample[UNI_B]], sample[POS_RES_B],
+                              DIFFERENT_CHAINS, f)
+            if res != INVALID_XL_POS:
+                already_created.add(sample[UNI_B])
+
+    f.close()
 
 
 def align_binary_search(alignment, pos, start, end):
@@ -106,7 +157,9 @@ def align(fasta_dict, xl_list):
 def main():
     fasta_dict = general_utils.load_obj(sys.argv[1])
     xl_list = general_utils.load_obj(sys.argv[2])
-    get_pdb_files(xl_list)
+    # get_pdb_files(xl_list)
+    write_ali_files(fasta_dict, xl_list)
+    # align(fasta_dict, xl_list)
 
 
 if __name__ == "__main__":
