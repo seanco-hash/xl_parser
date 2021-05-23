@@ -51,13 +51,45 @@ def get_pdb_files(xl_list, wanted_format="pdb"):
                 already_downloaded.add(name)
 
 
+def do_write_double(uni_code_a, seq_a, pos_a, uni_code_b, seq_b, pos_b):
+    file_name = 'ali_files_try\\' + uni_code_a + '_' + uni_code_b + '.ali'
+    f_out = open(file_name, 'w')
+    f_out.write(">P1;" + uni_code_a + '_' + uni_code_b + '\n')
+    f_out.write("sequence:" + uni_code_a + '_' + uni_code_b + '::::::::' + '\n')
+    f_out.write(seq_a + '/' + '\n')
+    f_out.write(seq_b + '*' + '\n')
+    f_out.write('\n')
+    f_out.write('>P1;_fix_pos\n')
+    f_out.write('sequence:x: :: :: : :-1.00:-1.00\n')
+    arr = ['0' for i in range(len(seq_a))]
+    arr[int(pos_a)-1] = '4'
+    s = "".join(arr)
+    f_out.write(s + '/' + '\n')
+    arr = ['0' for i in range(len(seq_b))]
+    arr[int(pos_b)-1] = '4'
+    s = "".join(arr)
+    f_out.write(s + '*' + '\n')
+    f_out.close()
+
+
+def write_double_ali(uni_code_a, seq_a, pos_a, uni_code_b, seq_b, pos_b, errors_file):
+    if len(seq_a) < 1 or len(seq_b) < 1:
+        errors_file.write(uni_code_a + " " + uni_code_b + '\n')
+        return INVALID_SEQ
+    if int(pos_a) >= len(seq_a) or int(pos_b) >= len(seq_b):
+        return INVALID_XL_POS
+    do_write_double(uni_code_a, seq_a, pos_a, uni_code_b, seq_b, pos_b)
+    do_write_double(uni_code_b, seq_b, pos_b, uni_code_a, seq_a, pos_a)
+    return SUCCESS
+
+
 def write_single_ali(uni_code, seq, pos_a, pos_b, errors_file):
     if len(seq) < 1:
         errors_file.write(uni_code + '\n')
         return INVALID_SEQ
     if int(pos_a) >= len(seq) or int(pos_b) >= len(seq):
         return INVALID_XL_POS
-    file_name = 'ali_files\\' + uni_code + '.ali'
+    file_name = 'ali_files_try\\' + uni_code + '.ali'
     f_out = open(file_name, 'w')
     f_out.write(">P1;" + uni_code + '\n')
     f_out.write("sequence:" + uni_code + '::::::::' + '\n')
@@ -79,20 +111,23 @@ def write_ali_files(fasta_dict, xl_list):
     f = open('bad_samples.txt', 'w')
     already_created = set()
     for sample in xl_list:
-        if sample[UNI_A] not in already_created:
+        if sample[UNI_A] == sample[UNI_B]:
+            key = sample[UNI_A]
+        else:
+            key = sample[UNI_A] + '.' + sample[UNI_B]
+        if key not in already_created:
             if sample[UNI_A] != sample[UNI_B]:
-                res = write_single_ali(sample[UNI_A], fasta_dict[sample[UNI_A]], sample[POS_RES_A],
-                                 DIFFERENT_CHAINS, f)
+                res = write_double_ali(sample[UNI_A], fasta_dict[sample[UNI_A]], sample[POS_RES_A],
+                                 sample[UNI_B], fasta_dict[sample[UNI_B]], sample[POS_RES_B], f)
+                if res != INVALID_XL_POS:
+                    already_created.add(key)
+                    key = sample[UNI_B] + '.' + sample[UNI_A]
+                    already_created.add(key)
             else:
                 res = write_single_ali(sample[UNI_A], fasta_dict[sample[UNI_A]], sample[POS_RES_A],
                                  sample[POS_RES_B], f)
-            if res != INVALID_XL_POS:
-                already_created.add(sample[UNI_A])
-        if sample[UNI_A] != sample[UNI_B] and sample[UNI_B] not in already_created:
-            res = write_single_ali(sample[UNI_B], fasta_dict[sample[UNI_B]], sample[POS_RES_B],
-                              DIFFERENT_CHAINS, f)
-            if res != INVALID_XL_POS:
-                already_created.add(sample[UNI_B])
+                if res != INVALID_XL_POS:
+                    already_created.add(key)
 
     f.close()
 
