@@ -36,7 +36,6 @@ def get_fasta(uniport):
 
 
 def create_fasta_dict(path):
-    start = time.time()
     input_file = open(path)
     idx = np.array(FASTA_IDX)
     xl_fasta_dict = {}
@@ -55,12 +54,10 @@ def create_fasta_dict(path):
         else:
             print(line)
 
-    end = time.time()
     print("number of fastas: " + str(len(xl_fasta_dict)) + '\n')
     print("number of samples: " + str(len(xl_samples)) + '\n')
-    print("time: " + str(end - start) + '\n')
-    save_obj(xl_fasta_dict, "fasta_files_all_samples")
-    save_obj(xl_samples, "all_samples")
+    save_obj(xl_fasta_dict, "all_fasta_dict")
+    # save_obj(xl_samples, "all_samples")
 
 
 def read_xl(path):
@@ -123,8 +120,8 @@ def read_all_clear_dup(path):
 def main():
     input_path = sys.argv[1]
     # output_path = sys.argv[2]
-    read_all_clear_dup(input_path)
-    # create_fasta_dict(input_path)
+    # read_all_clear_dup(input_path)
+    create_fasta_dict(input_path)
 
 
 if __name__ == "__main__":
