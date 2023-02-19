@@ -1,3 +1,4 @@
+import argparse
 import multiprocessing
 import subprocess
 import os
@@ -5,19 +6,23 @@ import numpy as np
 import general_utils
 from os import listdir
 import alpha_fold_files
-import general_xl_parser
 import pdb_files_manager
 from Bio import PDB
-from Bio import SeqIO
 from Bio.PDB.PDBParser import PDBParser
 from Bio.PDB.MMCIFParser import MMCIFParser
 from Bio.SeqUtils import seq1
+from Bio.PDB.DSSP import dssp_dict_from_pdb_file
+from Bio.PDB.DSSP import make_dssp_dict
 import copy
 import re
 import data_table_parser
 import general_xl_parser
-import matplotlib.pyplot as plt
 from os.path import isfile
+import csv
+import pandas as pd
+
+SS_DICT = {'H': 0, 'E': 1, 'B': 2, 'G': 3, 'I': 4, 'T': 5, 'S': 6, '-': 7}
+SS_HARD_DICT = {'H': 0, 'E': 1, 'B': 2, 'G': 2, 'I': 2, 'T': 2, 'S': 2, '-': 2}
 
 DSSO_SPACER = 10.3
 DSS_SPACER = 11.4
@@ -48,6 +53,16 @@ XL_TYPE = 14
 RES_A_TYPE = 15
 RES_B_TYPE = 16
 
+IN_RES_A = 0
+IN_CHAIN_A = 1
+IN_RES_B = 2
+IN_CHAIN_B = 3
+IN_PDB_PATH = 4
+IN_DISTANCE = 5
+IN_CB_DISTANCE = 6
+IN_LINKER = 7
+IN_XL_TYPE = 8
+
 OBJ_DIR = '/cs/labs/dina/seanco/xl_parser/obj/xl_objects/'
 OBJ_DIR_PREFIX = 'xl_objects/'
 PROCESSED_OBJ_DIR = '/cs/labs/dina/seanco/xl_parser/obj/processed/'
@@ -64,7 +79,8 @@ MEAN_PAE_ERROR = 7
 
 class CrossLink:
     def __init__(self, pep_a, pos_in_pep_a, res_num_a, uniport_a, pep_b, pos_in_pep_b, res_num_b,
-                 uniport_b, linker_type, pdb_file=None, db=""):
+                 uniport_b, linker_type, pdb_file=None, db="", pdb_path='', chain_a='', chain_b='', distance=0,
+                 cb_distance=0, xl_type=-1, error=INVALID_ERROR_VALUE, res_a_type=None, res_b_type=None):
         self.pep_a = pep_a.upper()
         self.pep_b = pep_b.upper()
         self.pos_in_pep_a = str(pos_in_pep_a)
@@ -76,16 +92,24 @@ class CrossLink:
         self.linker_type = linker_type
         self.pdb_file = pdb_file
         self.origin_db = db
-        self.distance = 0
-        self.error = INVALID_ERROR_VALUE
+        self.distance = distance
+        self.error = error
         self.pdb_type = -1
-        self.xl_type = -1
-        self.res_a_type = None
-        self.res_b_type = None
-        self.cb_distance = 0
+        self.res_a_type = res_a_type
+        self.res_b_type = res_b_type
+        self.cb_distance = cb_distance
         self.omega = 0  # cos, sin - symmetric, len == 2
         self.theta = 0  # cos(a_to_b), sin(a_to_b), cos(b_to_a), sin(b_to_a), len == 4
         self.phi = 0  # cos(a_to_b), sin(a_to_b), cos(b_to_a), sin(b_to_a), len == 4
+        self.chain_a = chain_a
+        self.chain_b = chain_b
+        self.pdb_path = pdb_path
+        self.xl_type = xl_type
+        if distance > 0:
+            if chain_a != chain_b:
+                self.xl_type = INTER_XL
+            else:
+                self.xl_type = INTRA_XL
 
     def cross_link_obj_to_list(self):
         lst = [self.pep_a, self.pos_in_pep_a, self.res_num_a, self.uniport_a, self.pep_b,
@@ -167,6 +191,24 @@ class CrossLink:
                 xl_dict[key1] = cl
                 already_in_dict.add(key1)
         return xl_dict
+
+    @staticmethod
+    def create_xl_objects_from_csv(file_path):
+        """
+        Creates xl_objects list from file
+        :param file_path: each row represents a object. format: aa_residue_number_a, chain_a, aa_residue_number_b,
+         chain_b, pdb_file_path, ca_distance, cb_distance, linker_type
+        :return: xl_objects list
+        """
+        with open(file_path, 'r') as f:
+            reader = csv.reader(f, delimiter=",")
+            objects = []
+            for row in reader:
+                tmp_obj = CrossLink('', -1, row[IN_RES_A], '', '', -1, row[IN_RES_B], '', row[IN_LINKER],
+                                    '', '', row[IN_PDB_PATH], row[IN_CHAIN_A], row[IN_CHAIN_B],
+                                    int(row[IN_DISTANCE]), int(row[IN_CB_DISTANCE]), int(row[IN_XL_TYPE]))
+                objects.append(tmp_obj)
+            return objects
 
     def validate_xl(self, polypep_list):
         length = sum(len(p) for p in polypep_list)
@@ -254,6 +296,7 @@ class CrossLink:
             res_a = CrossLink.search_residue_in_chain(self.pep_a, self.pos_in_pep_a, chain)
             if res_a != 0:
                 self.res_num_a = str(res_a.id[1])
+                self.chain_a = chain.id
         key = (' ', int(self.res_num_b), ' ')
         if key in chain:
             res_b = chain[key]
@@ -261,6 +304,7 @@ class CrossLink:
             res_b = CrossLink.search_residue_in_chain(self.pep_b, self.pos_in_pep_b, chain)
             if res_b != 0:
                 self.res_num_b = str(res_b.id[1])
+                self.chain_b = chain.id
         return res_a, res_b
 
     @staticmethod
@@ -277,26 +321,14 @@ class CrossLink:
     def process_single_xl(self, polypep_list=None, multichain=False, chains=None, error_objects=None):
         res_a, res_b = 0, 0
         chain_a, chain_b = 0, 0
-        if self.uniport_a == self.uniport_b and chains is None:
-            self.xl_type = INTRA_XL
-            cur_idx = 0
-            i = 0
-            while i < len(polypep_list) and (cur_idx <= int(self.res_num_a) or cur_idx <= int(self.res_num_b)):
-                chain = polypep_list[i]
-                if cur_idx <= int(self.res_num_a) <= cur_idx + len(chain):
-                    res_a = chain[int(self.res_num_a) - cur_idx - 1]
-                if cur_idx <= int(self.res_num_b) <= cur_idx + len(chain):
-                    res_b = chain[int(self.res_num_b) - cur_idx - 1]
-                cur_idx += len(chain)
-                i += 1
-        elif multichain:
+        if multichain:
             i = 0
             while i < len(chains) and (res_a == 0 or res_b == 0):
                 chain = chains[i]
-                if chain.id == self.uniport_a:
+                if chain.id == self.chain_a:
                     res_a, self.res_num_a = CrossLink.get_residue(chain, self.res_num_a, self.pep_a, self.pos_in_pep_a)
                     chain_a = chain
-                if chain.id == self.uniport_b:
+                if chain.id == self.chain_b:
                     res_b, self.res_num_b = CrossLink.get_residue(chain, self.res_num_b, self.pep_b, self.pos_in_pep_b)
                     chain_b = chain
                 i += 1
@@ -325,6 +357,98 @@ class CrossLink:
         self.res_a_type = res_a.resname
         self.res_b_type = res_b.resname
         return 0
+
+    @staticmethod
+    def get_closest_residues(chains, res_num, chain_id, k=5):
+        res = 0
+        chain_res = pdb_files_manager.get_chain_by_chain_id(chains, chain_id)
+        key = (' ', int(res_num), ' ')
+        res = chain_res[key]
+        closest = sorted(chain_res, key=lambda res_i: res['CA'] - res_i['CA'])[1:k + 1]
+        closest = [(c.id[1], seq1(c.resname)) for c in closest]
+        return closest
+
+    @staticmethod
+    def get_closest_res_dict():
+        return general_utils.load_obj("closest_residues")
+
+    @staticmethod
+    def create_closest_residues_dict(xl_objects, k=10):
+        xl_objects = sorted(xl_objects, key=lambda o: o.pdb_path)
+        prev_pdb = ''
+        pdb_parser = PDBParser(PERMISSIVE=1)
+        closest_dict = dict()
+        objects_for_ablations = []
+        for i, obj in enumerate(xl_objects):
+            try:
+                if obj.pdb_path != prev_pdb:
+                    closest_dict[obj.pdb_path] = dict()
+                    if obj.pdb_path[-3:] == 'cif':
+                        continue
+                    else:
+                        structure = pdb_parser.get_structure(obj.pdb_path.split('/')[-1], obj.pdb_path)
+                    chains = list(structure.get_chains())
+                obj.chain_a = obj.chain_a if obj.chain_a != '' else 'A'
+                obj.chain_b = obj.chain_b if obj.chain_b != '' else 'A'
+                for r, c in [(obj.res_num_a, obj.chain_a), (obj.res_num_b, obj.chain_b)]:
+                    if c not in closest_dict[obj.pdb_path]:
+                        closest_dict[obj.pdb_path][c] = dict()
+                    if r not in closest_dict[obj.pdb_path][c]:
+                        closest_dict[obj.pdb_path][c][r] = CrossLink.get_closest_residues(chains, r, c, k)
+            except Exception as e:
+                prev_pdb = obj.pdb_path
+                print(f"problem with object with pdb_file: {obj.pdb_path}, chains: {obj.chain_a}, {obj.chain_b}\n {e}")
+                continue
+            prev_pdb = obj.pdb_path
+            objects_for_ablations.append(obj)
+            if i % 100 == 0:
+                print(i)
+        general_utils.save_obj(closest_dict, "closest_residues")
+        general_utils.save_obj(objects_for_ablations, "ablation_objects")
+        print(len(objects_for_ablations))
+
+    @staticmethod
+    def create_mutation_pdbs():
+        xl_objects = general_utils.load_obj('ablation_objects')
+        xl_objects = sorted(xl_objects, key=lambda o: o.pdb_path)
+        prev_pdb = ''
+        pdb_parser = PDBParser(PERMISSIVE=1)
+        closest_dict = general_utils.load_obj('closest_residues')
+        processes = []
+        for i, obj in enumerate(xl_objects):
+            # if obj.pdb_path[-3:] != 'ent':
+            #     continue
+            if obj.pdb_path != prev_pdb:
+                seq_dict = {}
+                if obj.pdb_path[-3:] == 'cif':
+                    continue
+                else:
+                    structure = pdb_parser.get_structure(obj.pdb_path.split('/')[-1], obj.pdb_path)
+                chains = list(structure.get_chains())
+            seq_a, seq_b = pdb_files_manager.get_sequences_for_obj(obj, chains, seq_dict)
+            pref, suff = obj.pdb_path.split('.')
+            closest_a = closest_dict[obj.pdb_path][obj.chain_a][obj.res_num_a]
+            pdb_a = obj.pdb_path if len(chains) == 1 else f"{pref}_{obj.chain_a}.{suff}"
+            # p1 = multiprocessing.Process(target=pdb_files_manager.create_scwrl_mutation_files,
+            #                             args=(obj.res_num_a, obj.chain_a, closest_a, pdb_a, copy.deepcopy(seq_a),
+            #                                               pdb_files_manager.SCWRL_OUT_DIR))
+            # p1.start()
+            # processes.append(p1)
+            pdb_files_manager.create_scwrl_mutation_files(obj.res_num_a, obj.chain_a, closest_a, pdb_a, copy.deepcopy(seq_a),
+                                                          pdb_files_manager.SCWRL_OUT_DIR)
+            closest_b = closest_dict[obj.pdb_path][obj.chain_b][obj.res_num_b]
+            pdb_b = pdb_a if obj.chain_a == obj.chain_b else f"{pref}_{obj.chain_b}.{suff}"
+            # p2 = multiprocessing.Process(target=pdb_files_manager.create_scwrl_mutation_files,
+            #                              args=(obj.res_num_b, obj.chain_b, closest_b, pdb_b, copy.deepcopy(seq_b),
+            #                                    pdb_files_manager.SCWRL_OUT_DIR))
+            # p2.start()
+            # processes.append(p2)
+            pdb_files_manager.create_scwrl_mutation_files(obj.res_num_b, obj.chain_b, closest_b, pdb_b, copy.deepcopy(seq_b),
+                                                          pdb_files_manager.SCWRL_OUT_DIR)
+            prev_pdb = obj.pdb_path
+        # for p in processes:
+        #     p.join()
+
 
     @staticmethod
     def get_atom_distance_form_residues(res_a, res_b, atom_in_a, atom_in_b):
@@ -399,7 +523,8 @@ class CrossLink:
         return filtered
 
     @staticmethod
-    def process_all_xl(xl_objects, uni_chain_dict=None, pid=None, out_name=None, already_processed=False):
+    def process_all_xl(xl_objects, uni_chain_dict=None, pid=None, out_name=None, already_processed=False,
+                       inter_pdbs=None):
         # xl_objects = CrossLink.clear_dup_before_process(xl_objects)
         print(f"number of xl objects to process: {len(xl_objects)}\n")
         xl_objects.sort(key=lambda x: x.uniport_a)
@@ -426,8 +551,6 @@ class CrossLink:
         error_multichain_objects = []
         entity_chain_dict = pdb_files_manager.get_pdb_entity_chain_dict()
         i = 0
-        inter_pdbs = pdb_files_manager.get_inter_pdbs()
-        # inter_pdbs = None
         for cur_obj in xl_objects:
             i += 1
             if i > 1000:
@@ -486,9 +609,18 @@ class CrossLink:
                     else:
                         error_multichain_objects.append(cur_obj)
                         continue
+                cur_obj.pdb_path = pdb_file_name
                 processed_objects.append(cur_obj)
             prev_obj = cur_obj
             prev_pdb = pdb_file_name
+
+        if inter_pdbs is not None:
+            print("Retry failed multicahin objects with AF")
+            retry_objects = [obj for obj in error_multichain_objects if obj.uniport_a == obj.uniport_b]
+            process_failed_with_af = CrossLink.process_all_xl(retry_objects)
+            processed_objects = processed_objects + process_failed_with_af
+            print("Retry finished")
+
         print("xl with missing files: ", no_file_error)
         print("inter xl missing file: ", no_file_inter_xl)
         print("parsing errors: ", parser_exceptions)
@@ -505,10 +637,11 @@ class CrossLink:
         print(pdb_files_errors)
         print(f"files with potential numbering problem: {len(error_objects)}")
         print(f"objects failed with multichain: {len(error_multichain_objects)}")
-        # general_utils.save_obj(error_multichain_objects, 'error_multichain_objects')
+
         if pid is None:
             if out_name is not None:
-                # general_utils.save_obj(error_objects, 'numbering_problem_objects' + out_name)
+                general_utils.save_obj(error_multichain_objects, 'error_multichain_objects')
+                general_utils.save_obj(error_objects, 'numbering_problem_objects' + out_name)
                 general_xl_parser.XlParser.save_cross_links(processed_objects, None,
                                                             out_name, PROCESSED_OBJ_DIR_PREFIX)
         else:
@@ -622,7 +755,7 @@ class CrossLink:
         filtered = []
         uniports_included = set()
         for obj in xl_objects:
-            file_name = pdb_files_manager.find_pdb_file_from_xl_obj(obj, cif_files)
+            file_name = obj.pdb_path
             if file_name is None:
                 none_file_names.append(obj)
                 continue
@@ -658,8 +791,8 @@ class CrossLink:
         for obj in xl_objects:
             if int(obj.res_num_a) == -1 or int(obj.res_num_b) == -1:
                 continue
-            pdb_name = pdb_files_manager.find_pdb_file_from_xl_obj(obj, cif_files,
-                                                                   inter_pdbs=inter_pdbs).split('/')[-1].split('.')[0]
+            # All crosslinks from all chains exported to same file
+            pdb_name, _ = pdb_files_manager.get_obj_files_key(obj, cif_files, inter_pdbs, by_chain=False)
             if pdb_name in dict_by_uni:
                 dict_by_uni[pdb_name].append(obj)
             else:
@@ -687,8 +820,7 @@ class CrossLink:
         for obj in xl_objects:
             if int(obj.res_num_a) == -1 or int(obj.res_num_b) == -1:
                 continue
-            pdb_name = pdb_files_manager.find_pdb_file_from_xl_obj(obj, cif_files,
-                                                                   inter_pdbs=inter_pdbs).split('/')[-1].split('.')[0]
+            pdb_name = obj.pdb_path.split('/')[-1].split('.')[0]
             optional_chain_a, optional_chain_b = [], []
             if pdb_name.split('.')[-1] != 'cif':
                 pdb_files_manager.find_chain_ids_pdb(obj, entity_chain_dict, optional_chain_a, optional_chain_b,
@@ -697,8 +829,8 @@ class CrossLink:
                 structure = cif_parser.get_structure(pdb_name.split('/')[-1], pdb_name)
                 mmcif_dict = cif_parser.get_mmcif_dict()
                 pdb_files_manager.find_chain_ids_cif(obj, mmcif_dict, optional_chain_a, optional_chain_b)
-            obj.uniport_a = ''.join(optional_chain_a)
-            obj.uniport_b = ''.join(optional_chain_b)
+            obj.chain_a = ''.join(optional_chain_a)
+            obj.chain_b = ''.join(optional_chain_b)
             if pdb_name in dict_by_uni:
                 dict_by_uni[pdb_name].append(obj)
             else:
@@ -746,9 +878,7 @@ class CrossLink:
         cif_files = general_utils.load_obj('cif_files')
         inter_pdbs = pdb_files_manager.get_inter_pdbs()
         for obj in xl_obj:
-            if obj.res_num_a == obj.res_num_b and obj.uniport_a == obj.uniport_b:
-                continue
-            file_name = pdb_files_manager.find_pdb_file_from_xl_obj(obj, cif_files, inter_pdbs=inter_pdbs)
+            file_name = obj.pdb_path
             if file_name is not None:
                 filtered.append(obj)
         return filtered
@@ -800,7 +930,7 @@ class CrossLink:
         print(f"before filtering: {len(xl_objects)}")
         dups = 0
         for obj in xl_objects:
-            pdb_file = pdb_files_manager.find_pdb_file_from_xl_obj(obj, cif_files, inter_pdbs)
+            pdb_file = obj.pdb_path
             key = pdb_file.split('/')[-1].split('.')[0]
             if key not in residue_pairs_by_pdb:
                 residue_pairs_by_pdb[key] = set()
@@ -824,7 +954,7 @@ class CrossLink:
         intra_xl = 0
         inter_xl = 0
         for obj in xl_objects:
-            if obj.uniport_a == obj.uniport_b:
+            if obj.chain_a == obj.chain_b:
                 intra_xl += 1
             else:
                 inter_xl += 1
@@ -911,6 +1041,64 @@ class CrossLink:
         # CrossLink.process_all_xl(possible_objects, uni_chain_dict=chain_id_dict)
         return possible_objects, chain_id_dict
 
+    @staticmethod
+    def plot_ss_analysis():
+        ss_info = general_utils.load_obj("secondary_structure_info")
+        labels = ['H', 'B', 'L']
+        ss_info[ss_info[:, 0] > 1, 0] = SS_HARD_DICT['-']
+        ss_info[ss_info[:, 1] > 1, 1] = SS_HARD_DICT['-']
+        labels_to_plot = []
+        distances_by_ss = []
+        for i in range(3):
+            for j in range(i + 1):
+                data1 = ss_info[ss_info[:, 0] == i]
+                data1 = data1[data1[:, 1] == j, 2]
+                if i != j:
+                    data2 = ss_info[ss_info[:, 0] == j]
+                    data2 = data2[data2[:, 1] == i, 2]
+                    data = np.concatenate((data1, data2))
+                else:
+                    data = data1
+                distances_by_ss.append(data)
+                labels_to_plot.append(labels[i] + '_' + labels[j])
+        lengths = np.array([len(l) / 1000 for l in distances_by_ss])
+        general_utils.initialize_plt_params()
+        df1 = pd.DataFrame(lengths, columns=['lens'])
+        df1['labels'] = labels_to_plot
+        # general_utils.box_plot(distances_by_ss, labels_to_plot)
+        general_utils.plot_line(df1, None, "", "SS", "Num Samples (K)", bar=True, plot_values=False)
+
+    @staticmethod
+    def analyze_secondary_structure():
+        xl_objects = general_utils.load_obj('ablation_objects')
+        xl_objects = sorted(xl_objects, key=lambda o: o.pdb_path)
+        ss_info = np.zeros((len(xl_objects), 5))
+        for i, obj in enumerate(xl_objects):
+            if not os.path.isfile(obj.pdb_path + '.dssp'):
+                dssp_dict_from_pdb_file(obj.pdb_path, DSSP='/cs/staff/dina/software/Staccato/mkdssps')
+            dssp_dict = make_dssp_dict(obj.pdb_path + ".dssp")[0]
+            if obj.chain_a == '':
+                obj.chain_a = obj.chain_b = 'A'
+            try:
+                aa1, ss1, acc1 = dssp_dict[obj.chain_a, (' ', int(obj.res_num_a), ' ')][:3]
+                aa2, ss2, acc2 = dssp_dict[obj.chain_b, (' ', int(obj.res_num_b), ' ')][:3]
+            except KeyError as e:
+                try:
+                    aa1, ss1, acc1 = dssp_dict['A', (' ', int(obj.res_num_a), ' ')][:3]
+                    aa2, ss2, acc2 = dssp_dict['A', (' ', int(obj.res_num_b), ' ')][:3]
+                except KeyError as e:
+                    print(e)
+                    print(f"problem with {obj.pdb_path}, {obj.chain_a}, {obj.res_num_a}, {obj.chain_b}, {obj.res_num_b}")
+                    continue
+            ss_info[i][0] = SS_DICT[ss1]
+            ss_info[i][1] = SS_DICT[ss2]
+            ss_info[i][2] = obj.distance
+            ss_info[i][3] = obj.xl_type
+            ss_info[i][4] = LINKER_DICT[obj.linker_type]
+            if i % 1000 == 0:
+                general_utils.save_obj(ss_info, "secondary_structure_info")
+        general_utils.save_obj(ss_info, "secondary_structure_info")
+
 
 def get_uni_chain_id_dict():
     return general_utils.load_obj('uni_chain_id_dict')
@@ -952,7 +1140,19 @@ def analyze_predicted_align_error(xl_objects):
             errors.append(obj.error)
     print(count)
     print(np.average(errors))
-    general_utils.plot_histogram(errors, 'Predicted align error histogram')
+    general_utils.plot_histogram([errors], 'Predicted align error histogram')
+
+
+def search_hidden_dimers(xl_objects):
+    af_xl_obj = [obj for obj in xl_objects if obj.error != INVALID_ERROR_VALUE]
+    af_xl_obj = [obj for obj in af_xl_obj if obj.distance > 35]
+    viol_uniport_dict = dict()
+    for obj in af_xl_obj:
+        if obj.uniport_a not in viol_uniport_dict:
+            viol_uniport_dict[obj.uniport_a] = 0
+        viol_uniport_dict[obj.uniport_a] += 1
+    violated = sorted(list(viol_uniport_dict.items()), key=lambda item: item[1], reverse=True)
+    print(violated)
 
 
 def analyze_structures(xl_objects):
@@ -962,7 +1162,7 @@ def analyze_structures(xl_objects):
     pdb_structures = 0
     structures = set()
     for obj in xl_objects:
-        pdb_path = pdb_files_manager.find_pdb_file_from_xl_obj(obj, cif_files, inter_pdbs)
+        pdb_path = obj.pdb_path
         structures.add(pdb_path)
     for s in structures:
         if s[-3:] == 'cif' or s[-3:] == 'ent':
@@ -1022,7 +1222,7 @@ def count_missing_residues(xl_objects, cif_files=None, inter_pdbs=None, upd_exis
     for i, obj in enumerate(xl_objects):
         if obj.uniport_a == obj.uniport_b and obj.pdb_file not in inter_pdbs:
             continue
-        pdb_name = pdb_files_manager.find_pdb_file_from_xl_obj(obj, cif_files, inter_pdbs)
+        pdb_name = obj.pdb_path
         suff = pdb_name.split('.')[-1]  # cif or pdb
         if exclude_cif and suff == 'cif':
             continue
@@ -1051,8 +1251,8 @@ def analyze_inter_xl(exclude_cif=False, objects_file_name=None):
             continue
         if obj.pdb_file not in pdb_dict:
             pdb_dict[obj.pdb_file] = 0
-        triple_a = (obj.uniport_a, obj.uniport_b, obj.pdb_file, obj.linker_type)
-        triple_b = (obj.uniport_b, obj.uniport_a, obj.pdb_file, obj.linker_type)
+        triple_a = (obj.chain_a, obj.chain_b, obj.pdb_file, obj.linker_type)
+        triple_b = (obj.chain_b, obj.chain_a, obj.pdb_file, obj.linker_type)
         if triple_a in triple_dict:
             triple_dict[triple_a] += 1
         elif triple_b in triple_dict:
@@ -1093,8 +1293,8 @@ def filter_pdbs_from_xl_objects(xl_objects):
     new_xl_objects = []
     for obj in xl_objects:
         if obj.pdb_file in filter_pairs and \
-                ((filter_pairs[obj.pdb_file][0] == obj.uniport_a and filter_pairs[obj.pdb_file][1] == obj.uniport_b)
-                 or (filter_pairs[obj.pdb_file][0] == obj.uniport_b and filter_pairs[obj.pdb_file][1] == obj.uniport_a)):
+                ((filter_pairs[obj.pdb_file][0] == obj.chain_a and filter_pairs[obj.pdb_file][1] == obj.chain_b)
+                 or (filter_pairs[obj.pdb_file][0] == obj.chain_b and filter_pairs[obj.pdb_file][1] == obj.chain_a)):
             continue
         new_xl_objects.append(obj)
     return new_xl_objects
@@ -1103,8 +1303,8 @@ def filter_pdbs_from_xl_objects(xl_objects):
 def xlink_db_data_update_pipeline(data_path='/cs/labs/dina/seanco/xl_parser/data/xl_db_data_update.txt',
                                   stop_for_prediction=True, after_prediction=False):
     if not after_prediction:
-        data_table_parser.read_all_clear_dup(data_path)
-        general_xl_parser.XlParser.convert_old_xl_list_to_cross_link_objects()
+        # data_table_parser.read_all_clear_dup(data_path)
+        # general_xl_parser.XlParser.convert_old_xl_list_to_cross_link_objects()
         data_table_parser.update_uniport_fasta_dict_from_xl_objects()
         data_table_parser.fix_fasta_int_values()
 
@@ -1121,36 +1321,17 @@ def xlink_db_data_update_pipeline(data_path='/cs/labs/dina/seanco/xl_parser/data
         process_objects_pipeline()
 
 
-def extract_features_from_combined_data():
-    # inter_pdbs = pdb_files_manager.get_inter_pdbs()
-    # processed_xl_objects = get_upd_and_filter_processed_objects_pipeline(['processed_xl_objects_inter_and_intra_lys', 'processed_fixed_offset_objects'])
-    # CrossLink.export_objects_to_txt_format(processed_xl_objects, inter_pdbs=inter_pdbs,
-    #                                        out_path=pdb_files_manager.INTER_AND_INTRA_LYS_XL_FILES_PATH, skip_exist=False, dimer_form=False)
-    # pdb_files_manager.extract_xl_features_from_xl_objects(processed_xl_objects, inter_pdbs=inter_pdbs,
-    #                                                       xl_dir=pdb_files_manager.INTER_AND_INTRA_LYS_XL_FILES_PATH,
-    #                                                       out_dir=pdb_files_manager.INTER_INTRA_LYS_XL_NEIGHBORS_FILES_PATH,
-    #                                                       skip_exist=True)
-    # pdb_files_manager.read_features_to_dict(False, pdb_files_manager.INTER_INTRA_LYS_XL_NEIGHBORS_FILES_PATH,
-    #                                         pdb_files_manager.XL_NEIGHBORS_FEATURE_DICT_INTER_INTRA_LYS)
-    processed_xl_objects = get_upd_and_filter_processed_objects_pipeline(['intra_af_objects'])
-    CrossLink.export_objects_to_txt_format(processed_xl_objects, inter_pdbs=None,
-                                           out_path=pdb_files_manager.INTER_AND_INTRA_LYS_XL_FILES_PATH, skip_exist=True, dimer_form=False)
-    pdb_files_manager.extract_xl_features_from_xl_objects(processed_xl_objects, inter_pdbs=None,
-                                                          xl_dir=pdb_files_manager.INTER_AND_INTRA_LYS_XL_FILES_PATH,
-                                                          out_dir=pdb_files_manager.INTER_INTRA_LYS_XL_NEIGHBORS_FILES_PATH,
-                                                          skip_exist=True)
-    pdb_files_manager.read_features_to_dict(True, pdb_files_manager.INTER_INTRA_LYS_XL_NEIGHBORS_FILES_PATH,
-                                            pdb_files_manager.XL_NEIGHBORS_FEATURE_DICT_INTER_INTRA_LYS)
-
-
-def process_objects_pipeline():
-    xl_objects = CrossLink.load_all_xl_objects()
+def process_objects_pipeline(out_name='new_all_objects', xl_objects=None):
+    if xl_objects is None:
+        xl_objects = CrossLink.load_all_xl_objects()
     # xl_objects = general_utils.load_obj('error_multichain_objects')
     pdb_files_manager.update_xl_objects_with_obsolete_uniports(xl_objects)
     CrossLink.fix_peptides_all_xl_objects(xl_objects)
     xl_objects, uni_dict = CrossLink.map_inter_xl_objects_to_pdb(xl_objects)
     pdb_files_manager.create_dimers_dict(xl_objects, uni_dict)
-    # CrossLink.process_all_xl(xl_objects, uni_chain_dict=uni_dict)
+    inter_pdbs = pdb_files_manager.get_inter_pdbs()
+    download_pdb_cif_af_files(xl_objects, inter_pdbs)
+    CrossLink.process_all_xl(xl_objects, uni_chain_dict=uni_dict, out_name=out_name, inter_pdbs=inter_pdbs)
     # CrossLink.process_all_xl(xl_objects, uni_chain_dict=None, out_name='intra_af_objects')
     # CrossLink.process_all_xl(xl_objects)
 
@@ -1164,95 +1345,140 @@ def get_upd_and_filter_processed_objects_pipeline(specific_files=None):
             processed_xl_objects += general_utils.load_obj(file, PROCESSED_OBJ_DIR)
     print(f"initial amount: {len(processed_xl_objects)}")
     processed_xl_objects = CrossLink.update_linker_by_origin_db(processed_xl_objects)
-    processed_xl_objects = CrossLink.filter_xl_obj(processed_xl_objects, 100, 100)
+    processed_xl_objects = CrossLink.filter_xl_obj(processed_xl_objects, 45, 100)
     processed_xl_objects = CrossLink.clear_duplicates_of_xl_objects(processed_xl_objects, True)
     inter_pdbs = pdb_files_manager.get_inter_pdbs()
     cif_files = general_utils.load_obj('cif_files')
     processed_xl_objects = CrossLink.clear_duplicates_of_dimers(processed_xl_objects, cif_files, inter_pdbs)
+    pdb_files_manager.fix_objects_pdb_path(processed_xl_objects, cif_files, inter_pdbs)
     # processed_xl_objects = pdb_files_manager.filter_objects_from_list_by_pdb(processed_xl_objects, inter_pdbs=inter_pdbs)
     return processed_xl_objects
 
 
+def download_pdb_cif_af_files(xl_objects, inter_pdbs=None):
+    if inter_pdbs is None:
+        inter_pdbs = pdb_files_manager.get_inter_pdbs()
+    pdb_files_manager.download_pdbs_from_xl_objects(xl_objects, inter_pdbs)
+    pdb_files_manager.create_cif_set()
+    alpha_fold_files.get_af_of_cross_link_objects(xl_objects)
+
+
+def extract_features_pipeline(processed_xl_objects=None, objects_file_name=None):
+    """
+    Extracting features from xk objects - preparation for creating data set for NN. Takes few hours to run.
+    :param processed_xl_objects: Objects list or None. if None - name of pickle file must be provided.
+    :param objects_file_name: pickle file name of xl objects list.
+    :return:
+    """
+    if processed_xl_objects is None:
+        processed_xl_objects = general_utils.load_obj(objects_file_name)
+    inter_pdbs = pdb_files_manager.get_inter_pdbs()
+    CrossLink.export_objects_to_txt_format(processed_xl_objects, inter_pdbs=inter_pdbs,
+                                           out_path=pdb_files_manager.INTER_AND_INTRA_LYS_XL_FILES_PATH, skip_exist=False, dimer_form=False)
+    pdb_files_manager.extract_xl_features_from_xl_objects(processed_xl_objects, inter_pdbs=inter_pdbs,
+                                                          xl_dir=pdb_files_manager.INTER_AND_INTRA_LYS_XL_FILES_PATH,
+                                                          out_dir=pdb_files_manager.INTER_INTRA_LYS_XL_NEIGHBORS_FILES_PATH,
+                                                          skip_exist=False)
+    pdb_files_manager.read_features_to_dict(False, pdb_files_manager.INTER_INTRA_LYS_XL_NEIGHBORS_FILES_PATH,
+                                            pdb_files_manager.XL_NEIGHBORS_FEATURE_DICT_INTER_INTRA_LYS)
+
+
+def create_objects_from_csv(import_from_csv=True, parse_cfg=None, is_processed=True, out_name='new_all_objects',
+                            input_file_path=None, final_save_name=None, download_files=False):
+    """
+    Creates xl object list from a file.
+    :param import_from_csv: if True, creates xl objects from a file in our format
+    (identical to the objects exporting format). Else - parse objects from different format.
+    :param parse_cfg: Config file with parsing instructions. (only if import_from_csv is False).
+    :param is_processed: If False, objects does not have distance data - extracting distances from pdb (very slow)
+    :param out_name: If is_processed is False, name for savinf the processed objects
+    :param input_file_path: For importing from csv
+    :param final_save_name: if not None, saves the object list with the given name (give only name! not path)
+    :param download_files: if true - download pdb and af files to directories defined in 'pdb_files_manager.py' and 'alpha_fold_files.py'
+    :return:
+    """
+    if import_from_csv:
+        xl_objects = general_xl_parser.XlParser.import_xl_objects_from_csv(input_file_path,
+                                                                           pdb_files_manager.PDB_FILES_DIR)
+    else:
+        xl_objects = general_xl_parser.run_parsing(parse_cfg)
+    if not is_processed:
+        process_objects_pipeline(out_name, xl_objects)
+        xl_objects = get_upd_and_filter_processed_objects_pipeline()
+    if download_files and is_processed:
+        download_pdb_cif_af_files(xl_objects)
+    if final_save_name is not None:
+        general_utils.save_obj(xl_objects, final_save_name)
+    return xl_objects
+
+
+class ArgParser(argparse.ArgumentParser):
+
+    def __init__(self, **kwargs):
+        super(ArgParser, self).__init__(**kwargs)
+        self.add_argument(
+            "--run_mode",
+            help="Which utility to run: import / parse / extract",
+            default="import",
+            type=str,
+        )
+        self.add_argument(
+            "--parse_cfg",
+            help="config file for parsing instructions (optional)",
+            default=None,
+            type=str,
+        )
+        self.add_argument(
+            "--is_processed",
+            help="Is objects already contain distance info",
+            default=True,
+            type=bool
+        )
+        self.add_argument(
+            "--out_name",
+            help="Name for saving objects if processing is needed (optional)",
+            default=None,
+            type=str
+        )
+        self.add_argument(
+            "--input_file_path",
+            help="Path of file for importing objects",
+            default=None,
+            type=str
+        )
+        self.add_argument(
+            "--final_save_name",
+            help="Name of file for saving objects",
+            default=None,
+            type=str
+        )
+        self.add_argument(
+            "--download_files",
+            help="If true, downloading pdb, cif and alpha_fold pdb files for the objects, necessary for extracting "
+                 "distances, features and creating dataset",
+            default=True,
+            type=bool
+        )
+
+    def parse_args(self, args=None, namespace=None):
+        """ Parse the input arguments """
+        args = super(ArgParser, self).parse_args(args, namespace)
+        return args
+
+
 def main():
-    # process_objects_pipeline()
-    # CrossLink.unit_pickle_files()
-    # alpha_fold_files.remove_predicted_seqs_from_fasta()
-    # alpha_fold_files.fix_json_files_dir()
-    # alpha_fold_files.organize_local_alphfold_output()
-    # alpha_fold_files.check_missing_af_files()
-    #
-
-    # process_objects_pipeline()
-    # CrossLink.create_features_from_xl_objects(processed_xl_objects)
-    # processed_xl_dict = CrossLink.load_all_xl_objects_as_dict(PROCESSED_OBJ_DIR, PROCESSED_OBJ_DIR_PREFIX)
-    # CrossLink.find_unknown_linkers(CrossLink.load_all_xl_objects_as_list(processed_xl_objects))
-
-    # pdb_files_manager.complete_missing_xl_features(processed_xl_objects)
-
-    # pdb_files_manager.complete_missing_xl_features()
-    # pdb_files_manager.missing_pdb_sequences_to_fasta()
-    # general_utils.plot_funnel(2, 1, 0, "Docking Score of CASP13", "/cs/labs/dina/seanco/DockingXlScore/data/CASP13_target/prob_dock_out.txt")
-    # general_utils.plot_funnel(2, 1, 0, "Docking Score of CASP13",
-    #                           "/cs/labs/dina/seanco/DockingXlScore/data/CASP13_target/regular_dock_out.txt", False)
-    # pdb_files_manager.analyze_missing_files_of_objects(xl_objects)
-    # process_objects_pipeline()
-    #
-    # xl_objects = CrossLink.load_all_xl_objects()
-    # pdb_files_manager.update_xl_objects_with_obsolete_uniports(xl_objects)
-    # CrossLink.fix_peptides_all_xl_objects(xl_objects)
-    # xl_objects, uni_dict = CrossLink.map_inter_xl_objects_to_pdb(xl_objects)
-    # xl_objects = CrossLink.update_linker_by_origin_db(xl_objects)
-    # xl_objects = CrossLink.clear_duplicates_of_xl_objects(xl_objects, True)
-    # processed_xl_objects = get_upd_and_filter_processed_objects_pipeline('processed_xl_objects_inter')
-
-    # CrossLink.process_all_xl(xl_objects, uni_chain_dict=uni_dict)
-    # pdb_files_manager.create_cif_set()
-    # CrossLink.unit_processed_objects()
-    # pdb_files_manager.parse_pdb_headers()
-    # pdb_files_manager.test_pdb_entity_dict()
-    # d = pdb_files_manager.get_pdb_entity_chain_dict()
-    #
-    processed_xl_objects = get_upd_and_filter_processed_objects_pipeline()
-    # linker_type_histogram(processed_xl_objects)
-    # plot_xl_objects_distance_histogram(processed_xl_objects, 'Intra-Crosslink Distance Distribution', 'by_linker', 46)
-    plot_xl_objects_distance_histogram(processed_xl_objects, 'Intra-Crosslink Distance Distribution', 'all', 100)
-    # analyze_inter_xl(False)
-    # processed_xl_objects = get_upd_and_filter_processed_objects_pipeline('processed_xl_objects_intra_lys')
-    # xl_pdbs_obj, xl_cif_obj = pdb_files_manager.filter_cif_objects(processed_xl_objects)
-    # print(f"num pdbs obj: {len(xl_pdbs_obj)}, num cif obj: {len(xl_cif_obj)}")
-    # pdb_files_manager.analyze_extracted_features(xl_pdbs_obj)
-    # pdb_files_manager.analyze_extracted_features(xl_cif_obj)
-    # inter_pdbs = pdb_files_manager.get_inter_pdbs()
-    # inter_pdbs = None
-    # pdb_files_manager.extract_xl_features_from_xl_objects(processed_xl_objects, inter_pdbs=inter_pdbs,
-    #                                                       xl_dir=pdb_files_manager.INTER_AND_INTRA_LYS_XL_FILES_PATH,
-    #                                                       out_dir=pdb_files_manager.INTER_INTRA_LYS_XL_NEIGHBORS_FILES_PATH,
-    #                                                       skip_exist=False)
-    # pdb_files_manager.read_features_to_dict(False, pdb_files_manager.INTER_INTRA_LYS_XL_NEIGHBORS_FILES_PATH,
-    #                                         pdb_files_manager.XL_NEIGHBORS_FEATURE_DICT_INTER_INTRA_LYS)
-    # general_utils.plot_funnel()
-    # xl_objects = CrossLink.load_all_xl_objects(PROCESSED_OBJ_DIR, PROCESSED_OBJ_DIR_PREFIX)
-    # inter_pdbs = pdb_files_manager.get_inter_pdbs()
-    # cif_files = general_utils.load_obj('cif_files')
-    # xl_objects = general_utils.load_obj('numbering_problem_objects_inter_and_intra')
-    # fixed_objects = pdb_files_manager.create_xl_numbering_offset_dict(xl_objects)
-    # general_utils.save_obj(fixed_objects, 'fixed_offset_objects')
-    # fixed_objects = general_utils.load_obj('fixed_offset_objects')
-    # uni_dict = get_uni_chain_id_dict()
-    # objects = CrossLink.process_all_xl(fixed_objects, uni_dict, out_name='processed_fixed_offset_objects',
-    #                                    already_processed=True)
-    # processed_xl_objects = get_upd_and_filter_processed_objects_pipeline()
-    # analyze_predicted_align_error(processed_xl_objects)
-    # # # processed_xl_objects = CrossLink.clear_duplicates_of_dimers(processed_xl_objects, cif_files, inter_pdbs)
-    # CrossLink.export_objects_to_txt_format(processed_xl_objects, inter_pdbs=inter_pdbs,
-    #                                        out_path=pdb_files_manager.INTER_AND_INTRA_LYS_XL_FILES_PATH, skip_exist=False, dimer_form=False)
-    # pdb_files_manager.extract_xl_features_from_xl_objects(processed_xl_objects, inter_pdbs=inter_pdbs,
-    #                                                       xl_dir=pdb_files_manager.INTER_AND_INTRA_LYS_XL_FILES_PATH,
-    #                                                       out_dir=pdb_files_manager.INTER_INTRA_LYS_XL_NEIGHBORS_FILES_PATH,
-    #                                                       skip_exist=False)
-    # pdb_files_manager.read_features_to_dict(False, pdb_files_manager.INTER_INTRA_LYS_XL_NEIGHBORS_FILES_PATH,
-    #                                         pdb_files_manager.XL_NEIGHBORS_FEATURE_DICT_INTER_INTRA_LYS)
-    # extract_features_from_combined_data()
+    p = ArgParser()
+    args = p.parse_args()
+    if args.run_mode == 'import':
+        create_objects_from_csv(True, args.parse_cfg, args.is_processed, args.out_name, args.input_file_path,
+                                args.final_save_name, args.download_files)
+    elif args.run_mode == 'parse':
+        create_objects_from_csv(False, args.parse_cfg, args.is_processed, args.out_name, args.input_file_path,
+                                args.final_save_name, args.download_files)
+    elif args.run_mode == 'extract':
+        extract_features_pipeline(None, args.final_save_name)
+    else:
+        raise argparse.ArgumentTypeError(f"Invalid run mode: {args.run_mode}")
 
 
 if __name__ == "__main__":

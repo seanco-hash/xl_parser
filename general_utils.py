@@ -127,18 +127,18 @@ def seqs_dict_to_fasta(seqs, fasta_name):
 
 def initialize_plt_params():
     plt.rcParams.update({'axes.facecolor':'white'})
-    plt.gcf().subplots_adjust(bottom=0.15)
-    plt.gcf().subplots_adjust(left=0.15)
+    # plt.gcf().subplots_adjust(bottom=0.15)
+    # plt.gcf().subplots_adjust(left=0.15)
     # plt.gcf().subplots_adjust(top=0.8)
     plt.rc('font', size=SMALL_SIZE)          # controls default text sizes
     plt.rc('axes', titlesize=SMALL_SIZE)     # fontsize of the axes title
-    plt.rc('axes', labelsize=MEDIUM_SIZE)    # fontsize of the x and y labels
+    plt.rc('axes', labelsize=SMALL_SIZE)    # fontsize of the x and y labels
     plt.rc('xtick', labelsize=SMALL_SIZE)    # fontsize of the tick labels
     plt.rc('ytick', labelsize=SMALL_SIZE)    # fontsize of the tick labels
     plt.rc('legend', fontsize=VERY_SMALL_SIZE)    # legend fontsize
-    plt.rc('figure', titlesize=BIGGER_SIZE)  # fontsize of the figure title
+    plt.rc('figure', titlesize=SMALL_SIZE)  # fontsize of the figure title
     plt.grid(color='gray', linewidth=0.1)
-    plt.figure(dpi=300)
+    # plt.figure(dpi=300)
 
 
 def find_complexes_rank(rmsd, score, title):
@@ -266,15 +266,28 @@ def plot_funnel(r=4, s=3, v=2, t="TRIC",
             find_complexes_rank(color_arr, soap_score, "Soap ")
 
 
-def plot_line(x, y, title, x_labe, y_label):
-    initialize_plt_params()
-    plt.xticks(x)
-    plt.plot(x, y, marker='o')
+def plot_single_prediction_distribution(probas, targets, n=10):
+    for i in range(n):
+        y = probas[i]
+        plot_line(range(len(y)), y, f"distribution, y={targets[i]}", "class",
+                  "probability", False)
+
+
+def plot_line(x, y, title, x_labe, y_label, plot_values=True, bar=False):
+    # initialize_plt_params()
+    if bar:
+        sb.barplot(data=x, x='labels', y='lens')
+        # plt.bar(x, y)
+    else:
+        plt.xticks(x)
+        plt.plot(x, y, marker='o')
     plt.title(title, fontsize=BIGGER_SIZE)
     plt.xlabel(x_labe)
     plt.ylabel(y_label)
-    for index in range(len(x)):
-        plt.text(x[index], y[index], y[index], size=12)
+    plt.legend(["H: Helix", "B: Beta", "L: Loop"])
+    if plot_values:
+        for index in range(len(x)):
+            plt.text(x[index], y[index], y[index], size=12)
     plt.show()
 
 
@@ -285,7 +298,7 @@ def read_fasta_files(fasta_path):
     return uni_seq_dict
 
 
-def plot_histogram(data, title_, x_label='Value', y_label='Frequency', xticks_values=None, xticks_names=None, bins=None,
+def plot_histogram(data, title_="", x_label='Value', y_label='Frequency', xticks_values=None, xticks_names=None, bins=None,
                    data_labels=['x'], normalize=False, colors=['cadetblue']):
     initialize_plt_params()
     # bins = list(range(50)) + [52, 55, 60, 65, 70, 80, 90, 100, 125, 150, 200]
@@ -378,17 +391,138 @@ def plot_roc(labels, predictions, title, n_classes, class_names):
     initialize_plt_params()
     one_hot_labels = np.zeros((labels.size, labels.max() + 1))
     one_hot_labels[np.arange(labels.size), labels] = 1
-    auc = metrics.roc_auc_score(one_hot_labels, predictions, multi_class='ovo', average=None)
-    for label in range(n_classes):
-        preds = predictions[:, label]
-        fpr, tpr, _ = metrics.roc_curve(labels, preds, pos_label=label)
-        a = auc[label]
-        plt.plot(fpr, tpr, label=f"{class_names[label]}, auc={a:.3f}")
-    print(auc)
-    plt.legend(loc=4)
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title(title, fontsize=BIGGER_SIZE)
-    # plt.savefig(os.path.join(self.fig_save_path, self.title))
-    # plt.show()
-    return plt
+    try:
+        auc = metrics.roc_auc_score(one_hot_labels, predictions, multi_class='ovo', average=None)
+        for label in range(n_classes):
+            preds = predictions[:, label]
+            fpr, tpr, _ = metrics.roc_curve(labels, preds, pos_label=label)
+            a = auc[label]
+            plt.plot(fpr, tpr, label=f"{class_names[label]}, auc={a:.3f}")
+        print(auc)
+        plt.legend(loc=4)
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title(title, fontsize=BIGGER_SIZE)
+        # plt.savefig(os.path.join(self.fig_save_path, self.title))
+        # plt.show()
+        return plt, auc
+    except Exception as e:
+        print(e)
+        return None, None
+
+
+def chatgpt_ablation_plot():
+    # define the data for the plot
+    components = ['A', 'B', 'C', 'D']
+    baseline_performance = 0.8
+    ablation_results = [0.7, 0.75, 0.6, 0.78]
+
+    # create a bar plot
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.bar(components, ablation_results, color='gray')
+
+    # add a horizontal line for the baseline performance
+    ax.axhline(y=baseline_performance, color='black', linestyle='--')
+
+    # set the axis labels and title
+    ax.set_xlabel('Components', fontsize=14)
+    ax.set_ylabel('Performance', fontsize=14)
+    ax.set_title('Ablation Study Results', fontsize=16)
+
+    # add text labels for each bar
+    for i, result in enumerate(ablation_results):
+        ax.text(i, result + 0.01, f'{result:.2f}', ha='center', fontsize=12)
+
+    # add a legend for the baseline and modified bars
+    ax.legend(['Baseline', 'Modified'], fontsize=12)
+
+    # adjust the layout of the plot
+    fig.tight_layout()
+
+    # show the plot
+    plt.show()
+
+def af_plot_ablation():
+    # data for the plot
+    names = ['Baseline', 'SA', 'MSA', 'Recycle', 'Recycle+MSA']
+    accuracy = [57.7, 58.2, 59.6, 61.1, 62.6]
+    runtime = [1.0, 1.7, 23.6, 7.9, 166.1]
+
+    # create a figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 4))
+
+    # create the accuracy plot on the first subplot
+    ax1.bar(names, accuracy)
+    ax1.set_ylim([0, 70])
+    ax1.set_ylabel('CA', fontsize=12)
+    ax1.tick_params(axis='y', labelsize=10)
+    ax1.set_title('Accuracy (%)', fontsize=14)
+
+    # create the runtime plot on the second subplot
+    ax2.bar(names, runtime)
+    ax2.set_yscale('log')
+    ax2.set_ylim([0.1, 1000])
+    ax2.set_ylabel('Time (s)', fontsize=12)
+    ax2.tick_params(axis='y', labelsize=10)
+    ax2.set_title('Runtime (s)', fontsize=14)
+
+    # adjust the layout of the subplots and save the figure
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_ablation():
+    # bar_width = 0.35
+    initialize_plt_params()
+    x_single = [1, 2, 3, 4, 5, 6, 7, 8]
+    y_single = [0.6195, 0.6115, 0.6119, 0.6290, 0.6797, 0.7267, 0.8078, 0.6862]
+
+    x_ticks_single = ['anchors', 'radius', 'charge', 'id', 'asa', 'mol2', 'res_type', 'ss']
+    plt.bar(x_single, y_single, color='cornflowerblue')
+    # plt.bar([p + bar_width for p in x_single], auc_inter_single, color='navy')
+    plt.xticks(x_single, x_ticks_single,rotation='vertical')
+    plt.tight_layout()
+    plt.ylabel("Average AUC")
+    plt.axhline(y=0.857519, color='black',  linestyle='--')
+    plt.ylim([0, 1])
+    plt.show()
+
+    auc_inter_single = [0.6213, 0.6264, 0.6269, 0.6334, 0.5690, 0.631, 0.7177, 0.6088]
+    plt.axhline(y=0.6958, color='black', linestyle='--')
+    plt.bar(x_single, auc_inter_single, color='cornflowerblue')
+    plt.xticks(x_single, x_ticks_single, rotation='vertical')
+    plt.ylim([0, 1])
+    plt.tight_layout()
+    plt.show()
+
+    x_all_but = [7, 6, 4, 5, 3, 2, 1, 8]
+    y_all_but = [0.8012, 0.8454, 0.8312, 0.8627, 0.84531, 0.8397, 0.8208, 0.8799]
+    x_all_but_ticks = ['res-type', 'mol2', 'id', 'asa', 'charge', 'radius', 'anchors', 'ss']
+    plt.bar(x_all_but, y_all_but, color='cornflowerblue')
+    plt.axhline(y=0.857519, color='black', linestyle='--')
+    plt.xticks(x_all_but, x_all_but_ticks, rotation='vertical')
+    plt.tight_layout()
+    plt.ylim([0, 1])
+    plt.ylabel("Average AUC")
+    plt.show()
+
+    auc_inter_all_but = [0.6334, 0.6691, 0.6414, 0.7021, 0.6770, 0.6677, 0.6764, 0.5686]
+    plt.bar(x_all_but, auc_inter_all_but, color='cornflowerblue')
+    plt.axhline(y=0.6958, color='black', linestyle='--')
+    plt.xticks(x_all_but, x_all_but_ticks, rotation='vertical')
+    plt.tight_layout()
+    plt.ylim([0, 1])
+    plt.show()
+    # plt.bar([p + bar_width for p in x_all_but], auc_inter_all_but, color='darkred')
+
+    y_all = [0.8575195567241383]
+    inter_auc_all = [0.6958]
+    # inter_auc_all = [0.6483661204104554]
+
+
+def box_plot(arr, labels, title='Residue SS types to distance'):
+    fig7, ax7 = plt.subplots()
+    ax7.set_title(title)
+    ax7.boxplot(arr, notch=True, labels=labels)
+    # plt.savefig("/cs/labs/dina/seanco/xl_parser/plots/ss_dist_box_plot.png")
+    plt.show()

@@ -4,13 +4,12 @@ import os
 import general_utils
 from Bio import PDB
 from Bio.PDB.PDBParser import PDBParser
-from Bio import pairwise2
 import torch
-from Bio import SeqIO
 from Bio.SeqUtils import seq1
 from Bio.PDB.PDBIO import PDBIO
 from Bio.PDB.mmcifio import MMCIFIO
 from Bio.PDB.MMCIFParser import MMCIFParser
+from Bio.PDB.DSSP import dssp_dict_from_pdb_file
 from os.path import isfile
 import shutil
 import alpha_fold_files
@@ -23,7 +22,10 @@ from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from selenium.webdriver.common.by import By
 import json
 
-
+SCWRL_OUT_DIR = '/cs/labs/dina/seanco/xl_parser/scwrl/'
+SCWRL_SCRIPT = '~dina/software/progs/scwrl4/Scwrl4 '
+DSSP_CIF_SCRIPT = '/cs/labs/dina/seanco/needle/project/venv_needle/bin/biolib run bio_utils/DSSP -i '
+DSSP_SCRIPT = '/cs/labs/dina/seanco/xl_mlp_nn/run_dssp.sh '
 WORKDIR = "/cs/labs/dina/seanco/xl_parser/"
 PDB_FILES_DIR = "/cs/labs/dina/seanco/xl_parser/pdbs/"
 FASTA_TO_PREDICT = "/cs/labs/dina/seanco/xl_parser/fasta_to_predict.fasta"
@@ -36,9 +38,12 @@ XL_NEIGHBORS_EXE = "/cs/labs/dina/seanco/xl_neighbors/xl_neighbors"
 XL_NEIGHBORS_FILES_PATH = "/sci/labs/dina/seanco/xl_neighbors/feature_files/"
 INTRA_LYS_XL_NEIGHBORS_FILES_PATH = "/cs/labs/dina/seanco/xl_neighbors/intra_lys_feature_files/"
 INTER_INTRA_LYS_XL_NEIGHBORS_FILES_PATH = "/cs/labs/dina/seanco/xl_neighbors/inter_intra_lys_feature_files/"
+XL_NEIGHBORS_FILES_NO_CIF = "/cs/labs/dina/seanco/xl_neighbors/feature_files_no_cif/"
 XL_NEIGHBORS_FEATURE_DICT = "xl_neighbors_feature_dict"
 XL_NEIGHBORS_FEATURE_DICT_INTRA_LYS = "xl_neighbors_feature_dict_intra_lys"
 XL_NEIGHBORS_FEATURE_DICT_INTER_INTRA_LYS = "xl_neighbors_feature_dict_inter_intra_lys"
+XL_NEIGHBORS_FEATURE_DICT_NO_CIF = "xl_neighbors_feature_dict_no_cif"
+XL_NEIGHBORS_FEATURE_DICT_ONLY_CIF = "xl_neighbors_feature_dict_only_cif"
 UNIPARC_WEB_PATH = 'https://www.uniprot.org/uniparc?query='
 UNIPROT_WEB_PATH = 'https://www.uniprot.org/uniprotkb?query='
 UNIPORTS_DICT = 'obsolete_new_uniports_dict'
@@ -46,6 +51,13 @@ PARSE_HEADER_COMMAND = "grep COMPND pdb5a2q.ent | grep -E 'MOL_ID|CHAIN'"
 INVALID_OFFSET = -11111
 LINKER_MAX_DIST = {'DSSO': 32, 'BDP_NHP': 35, 'DSS': 32, 'UNKNOWN': 35, 'BDP-NHP': 35, '': 35, 'LEIKER': 35, None: 35,
                    'QPIR': 35, 'A-DSBSO': 35}
+EXTENDED_AA_LETTERS = "ACDEFGHIKLMNPQRSTVWYBXZJUO"
+AA_TABLE_IDX = {'A': 0, 'C': 1, 'D': 2, 'E': 3, 'F': 4, 'G': 5, 'H': 6, 'I': 7, 'K': 8, 'L': 9, 'M': 10,
+                'N': 11, 'P': 12, 'Q': 13, 'R': 14, 'S': 15, 'T': 16, 'V': 17, 'W': 18, 'Y': 19,
+                'B': 20, 'X': 21, 'Z': 22, 'J': 23, 'U': 24, 'O': 25}
+AA_LETTERS = "ACDEFGHIKLMNPQRSTVWY"
+PDB_2_FASTA = '/cs/staff/dina/utils/pdb2fasta'
+FASTA_PATH = '/cs/labs/dina/seanco/xl_parser/fasta_files/'
 
 
 def copy_wrong_dir_models():
@@ -68,8 +80,7 @@ def download_single_pdb(name, downloaded, invalid, parser, file_format):
     """
     if name not in downloaded:
         if name not in invalid:
-            ret_val = parser.retrieve_pdb_file(name, pdir="./pdbs", overwrite=False,
-                                             file_format=file_format)
+            ret_val = parser.retrieve_pdb_file(name, pdir=PDB_FILES_DIR, overwrite=False, file_format=file_format)
             if os.path.exists(ret_val):
                 downloaded.add(name)
                 return True
@@ -183,10 +194,10 @@ def check_missing_files(xl_list, wanted_format="pdb"):
     general_utils.save_obj(invalid_download, "missing_pdbs")
 
 
-def create_cif_set():
+def create_cif_set(pdb_files_dir='./pdbs'):
     cif_files = general_utils.load_obj('cif_files')
     print(f"Initial set size: {len(cif_files)}")
-    for filename in os.listdir('./pdbs'):
+    for filename in os.listdir(pdb_files_dir):
         if filename.endswith(".cif"):
             pdb_name = filename.split('.')[0]
             cif_files.add(pdb_name.upper())
@@ -348,14 +359,21 @@ def missing_pdb_sequences_to_fasta():
                 o_f.write(uni + '\n')
 
 
-def export_single_chain_to_pdb(chain, pdb_file_path):
+def check_pdb_chain_file_exist(chain_id, pdb_file_path):
     pdb_name_split = pdb_file_path.split('/')
     pref, suff = pdb_name_split[-1].split('.')
-    new_name = pref + '_' + chain.id + '.' + suff
+    new_name = pref + '_' + chain_id + '.' + suff
     new_path = '/'.join(pdb_name_split[:-1]) + '/' + new_name
     if isfile(new_path):
+        return True, new_path
+    return False, new_path
+
+
+def export_single_chain_to_pdb(chain, pdb_file_path):
+    exist, new_path = check_pdb_chain_file_exist(chain.id, pdb_file_path)
+    if exist:
         return
-    if suff == 'cif':
+    if new_path[-3:] == 'cif':
         io = MMCIFIO()
     else:
         io = PDBIO()
@@ -371,6 +389,29 @@ def export_chains_to_pdb(chains, pdb_file_path, chain_a, chain_b):
             done += 1
         if done == 2:
             break
+
+
+def export_chains_to_pdb_from_xl_objects(xl_objects):
+    inter_pdbs = get_inter_pdbs()
+    cif_files = general_utils.load_obj('cif_files')
+    pdb_parser = PDBParser(PERMISSIVE=1)
+    cif_parser = MMCIFParser()
+    xl_objects = sorted(xl_objects, key=lambda o: o.uniport_a)
+    prev_pdb = '-1'
+    for obj in xl_objects:
+        pdb_file_path = find_pdb_file_from_xl_obj(obj, cif_files, inter_pdbs=inter_pdbs)
+        a_exist, _ = check_pdb_chain_file_exist(obj.chain_a, pdb_file_path)
+        b_exist, _ = check_pdb_chain_file_exist(obj.chain_b, pdb_file_path)
+        if (a_exist and b_exist) or pdb_file_path is None:
+            continue
+        if pdb_file_path != prev_pdb and pdb_file_path is not None:
+            if pdb_file_path[-3:] == 'cif':
+                structure = cif_parser.get_structure(pdb_file_path.split('/')[-1], pdb_file_path)
+            else:
+                structure = pdb_parser.get_structure(pdb_file_path.split('/')[-1], pdb_file_path)
+            tmp_chains = list(structure.get_chains())
+            prev_pdb = pdb_file_path
+        export_chains_to_pdb(tmp_chains, pdb_file_path, obj.chain_a, obj.chain_b)
 
 
 def find_chain_ids_cif(obj, mmcif_dict, optional_chain_a, optional_chain_b):
@@ -405,20 +446,9 @@ def process_multichain_xl_object(obj, chains, fasta_dict, structure, max_dist=45
     if uni_chain_dict is None:
         print("error: process multichain object by uni_dict is none")
         return None
-    #     seq_a = fasta_dict[obj.uniport_a]
-    #     seq_b = fasta_dict[obj.uniport_b]
-    #
-    #     for chain_id, chain_seq in chains.items():
-    #         # chain_seq = chain.get_sequence()
-    #         score_a = pairwise2.align.localxx(seq_a, chain_seq, score_only=True)
-    #         score_b = pairwise2.align.localxx(seq_b, chain_seq, score_only=True)
-    #         if len(chain_seq) == score_a or (obj.pep_a != '' and obj.pep_a in chain_seq):
-    #             optional_chain_a.add(chain_id.split(':')[-1])
-    #         elif len(chain_seq) == score_b or (obj.pep_b != '' and obj.pep_b in chain_seq):
-    #             optional_chain_b.add(chain_id.split(':')[-1])
     elif already_processed:
-        optional_chain_a = {obj.uniport_a}
-        optional_chain_b = {obj.uniport_b}
+        optional_chain_a = {obj.chain_a}
+        optional_chain_b = {obj.chain_b}
     elif mmcif_dict is not None:
         find_chain_ids_cif(obj, mmcif_dict, optional_chain_a, optional_chain_b)
     else:
@@ -432,8 +462,8 @@ def process_multichain_xl_object(obj, chains, fasta_dict, structure, max_dist=45
     for a in optional_chain_a:
         for b in optional_chain_b:
             tmp_obj = copy.deepcopy(obj)
-            tmp_obj.uniport_a = a
-            tmp_obj.uniport_b = b
+            tmp_obj.chain_a = a
+            tmp_obj.chain_b = b
             tmp_obj.process_single_xl(None, multichain=True, chains=tmp_chains, error_objects=error_object)
             if 0 < tmp_obj.distance:
                 tmp_objects.append(tmp_obj)
@@ -447,10 +477,10 @@ def process_multichain_xl_object(obj, chains, fasta_dict, structure, max_dist=45
         counters[4] += 1
     tmp = tmp_objects[0]
     try:
-        export_chains_to_pdb(tmp_chains, pdb_file_path, tmp.uniport_a, tmp.uniport_b)
+        export_chains_to_pdb(tmp_chains, pdb_file_path, tmp.chain_a, tmp.chain_b)
     except Exception as e:
         print(e)
-        print(f"export chain error. file: {pdb_file_path}, chains: {tmp.uniport_a}, {tmp.uniport_b}, uniports: {obj.uniport_a}, {obj.uniport_b}")
+        print(f"export chain error. file: {pdb_file_path}, chains: {tmp.chain_a}, {tmp.chain_b}, uniports: {obj.uniport_a}, {obj.uniport_b}")
         return None
     return tmp
 
@@ -470,28 +500,25 @@ def create_single_pdb_xl_list_txt_file(xl_objects, pdb_name, cif_files, counters
         f = open(new_file_path, 'w')
         # pdb_file = None
     for obj in xl_objects:
-        if obj.uniport_a == obj.uniport_b and \
-                (inter_pdbs is None or obj.pdb_file not in inter_pdbs):
-            line = f"{obj.res_num_a} A {obj.res_num_b} A 1 {LINKER_MAX_DIST[obj.linker_type]}\n"
-            if line not in existing_lines:
-                f.write(line)
-                opposite_line = f"{obj.res_num_b} A {obj.res_num_a} A 1 {LINKER_MAX_DIST[obj.linker_type]}\n"
-                existing_lines.add(opposite_line)
-        else:
-            chain_a, chain_b = obj.uniport_a, obj.uniport_b
-            if dimer_dict is not None:
-                if pdb_name in dimer_dict:
-                    cur_dict = dimer_dict[pdb_name]
-                    if chain_a in cur_dict:
-                        chain_a = cur_dict[chain_a]
-                    if chain_b in cur_dict:
-                        chain_b = cur_dict[chain_b]
-            line = f"{obj.res_num_a} {chain_a} {obj.res_num_b} {chain_b} 1 {LINKER_MAX_DIST[obj.linker_type]}\n"
-            if line not in existing_lines:
-                f.write(line)
-                existing_lines.add(line)
-                opposite_line = f"{obj.res_num_b} {chain_b} {obj.res_num_a} {chain_a} 1 {LINKER_MAX_DIST[obj.linker_type]}\n"
-                existing_lines.add(opposite_line)
+        chain_a, chain_b = obj.chain_a, obj.chain_b
+        if chain_a == '' or chain_b == '':
+            if obj.uniport_a == obj.uniport_b and (inter_pdbs is None or obj.pdb_file not in inter_pdbs or (obj.pdb_path != '' and obj.pdb_path[-3:] == 'pdb')):
+                chain_a = chain_b = 'A'
+            else:
+                chain_a, chain_b = obj.uniport_a, obj.uniport_b
+        if dimer_dict is not None:
+            if pdb_name in dimer_dict:
+                cur_dict = dimer_dict[pdb_name]
+                if chain_a in cur_dict:
+                    chain_a = cur_dict[chain_a]
+                if chain_b in cur_dict:
+                    chain_b = cur_dict[chain_b]
+        line = f"{obj.res_num_a} {chain_a} {obj.res_num_b} {chain_b} 1 {LINKER_MAX_DIST[obj.linker_type]}\n"
+        if line not in existing_lines:
+            f.write(line)
+            existing_lines.add(line)
+            opposite_line = f"{obj.res_num_b} {chain_b} {obj.res_num_a} {chain_a} 1 {LINKER_MAX_DIST[obj.linker_type]}\n"
+            existing_lines.add(opposite_line)
     f.close()
 
 
@@ -510,9 +537,9 @@ def single_thread_extract_xl_features(xl_file_paths, pdb_files, output_path=XL_N
             p.communicate()
         else:
             processes.append(p)
-        if i % 1000 == 0:
-            print(f"Extracted {i} feature files")
-    exit_codes = [p.wait() for p in processes]
+        # if i % 1000 == 0:
+        #     print(f"Extracted {i} feature files")
+    # exit_codes = [p.wait() for p in processes]
 
 
 def complete_missing_xl_features(xl_objects, cif_files=None):
@@ -520,12 +547,18 @@ def complete_missing_xl_features(xl_objects, cif_files=None):
         cif_files = general_utils.load_obj('cif_files')
     missing_objects = []
     for obj in xl_objects:
-        pdb_name = find_pdb_file_from_xl_obj(obj, cif_files).split('/')[-1].split('.')[0]
+        pdb_name = obj.pdb_path.split('/')[-1].split('.')[0]
         feat_file = XL_NEIGHBORS_FILES_PATH + pdb_name + '.txt'
         if not isfile(feat_file):
             missing_objects.append(obj)
     print(f"objects with missing feature files: {len(missing_objects)}")
     extract_xl_features_from_xl_objects(missing_objects, cif_files)
+
+
+def fix_objects_pdb_path(xl_objects, cif_files, inter_pdbs):
+    objects = [o for o in xl_objects if o.chain_a != '' and o.pdb_path[-3:] == 'pdb']
+    for obj in objects:
+        obj.chain_a = obj.chain_b = ''
 
 
 def extract_xl_features_from_xl_objects(xl_objects, cif_files=None, inter_pdbs=None, xl_dir=OUTPUT_XL_FILES_PATH,
@@ -535,16 +568,15 @@ def extract_xl_features_from_xl_objects(xl_objects, cif_files=None, inter_pdbs=N
     xl_file_paths = set()
     pdb_files_dict = dict()
     for obj in xl_objects:
-        pdb_file = find_pdb_file_from_xl_obj(obj, cif_files, inter_pdbs=inter_pdbs)
-        pdb_name = pdb_file.split('/')[-1].split('.')[0]
+        pdb_name, pdb_file = get_obj_files_key(obj, cif_files, inter_pdbs, by_chain=False)
         xl_file_path = xl_dir + pdb_name + '.txt'
         xl_file_paths.add(xl_file_path)
-        if inter_pdbs is not None and obj.pdb_file in inter_pdbs:
+        if obj.chain_a != '' and pdb_file[-3:] != 'pdb':
             if pdb_file not in pdb_files_dict:
                 pdb_files_dict[pdb_file] = set()
             pdb_pref, suff = pdb_file.split('.')
-            pdb_files_dict[pdb_file].add(pdb_pref + '_' + obj.uniport_a + '.' + suff)
-            pdb_files_dict[pdb_file].add(pdb_pref + '_' + obj.uniport_b + '.' + suff)
+            pdb_files_dict[pdb_file].add(pdb_pref + '_' + obj.chain_a + '.' + suff)
+            pdb_files_dict[pdb_file].add(pdb_pref + '_' + obj.chain_b + '.' + suff)
         else:
             pdb_files_dict[pdb_file] = {pdb_file}
     xl_file_paths = sorted(xl_file_paths)
@@ -595,31 +627,42 @@ def extract_xl_features(multi_thread=False, xl_files=None, pdb_files=None):
         print(e)
 
 
-def find_feature_dict_keys_by_pdb(obj, cif_files, inter_pdbs, feat_dict, problems):
-    file_name = find_pdb_file_from_xl_obj(obj, cif_files, inter_pdbs)
-    uni_a = uni_b = file_name.split('/')[-1].split('.')[0]
-    if obj.uniport_a != obj.uniport_b or uni_a not in feat_dict:
-        pref = ''
-        if obj.pdb_file not in cif_files:
-            pref = 'pdb'
-        uni_a = pref + obj.pdb_file.lower() + '_' + obj.uniport_a
-        uni_b = pref + obj.pdb_file.lower() + '_' + obj.uniport_b
-        if uni_a not in feat_dict or uni_b not in feat_dict:
-            print(f"Problem type 0 with: {uni_a}, {uni_b}")
-            problems[0] += 1
-            return None, None
-    return uni_a, uni_b
+def get_obj_files_key(obj, cif_files, inter_pdbs, by_chain=True):
+    """
+    Returns the file key of the xl object, which is used in different dictionaries and file name
+    (feature and xl files)
+    :param inter_pdbs:
+    :param cif_files:
+    :param obj:
+    :param by_chain: if true - returns <pdb_key>_<chain_a>, <pdb_key>_<chain_b> else, returns <pdb_key>, None
+    """
+    pdb_file = obj.pdb_path
+    if pdb_file == '':
+        pdb_file = find_pdb_file_from_xl_obj(obj, cif_files, inter_pdbs)
+        if pdb_file is None:
+            pdb_file = find_pdb_file_from_xl_obj(obj, cif_files)
+            if pdb_file is None:
+                return None, None
+    pdb_name = pdb_file.split('/')[-1].split('.')[0]
+    if by_chain:
+        if obj.chain_a != '' and obj.chain_b != '':
+            pdb_name_a = f"{pdb_name}_{obj.chain_a}"
+            pdb_name_b = f"{pdb_name}_{obj.chain_b}"
+            return pdb_name_a, pdb_name_b
+        else:
+            return pdb_name, pdb_name
+    return pdb_name, pdb_file
 
 
 def find_feature_dict_keys_from_xl_obj(obj, feat_dict, problems, cif_files, inter_pdbs, feat_by_pdb=True, predict=False):
     if feat_by_pdb and not predict:
-        uni_a, uni_b = find_feature_dict_keys_by_pdb(obj, cif_files, inter_pdbs, feat_dict, problems)
+        uni_a, uni_b = get_obj_files_key(obj, cif_files, inter_pdbs, True)
         if uni_a not in feat_dict or uni_b not in feat_dict:
             uni_a, uni_b = obj.uniport_a.split('-')[0].split('.')[0], obj.uniport_b.split('-')[0].split('.')[0]
     else:
         uni_a, uni_b = obj.uniport_a.split('-')[0].split('.')[0], obj.uniport_b.split('-')[0].split('.')[0]
         if uni_a not in feat_dict or uni_b not in feat_dict:
-            uni_a, uni_b = find_feature_dict_keys_by_pdb(obj, cif_files, inter_pdbs, feat_dict, problems)
+            uni_a, uni_b = get_obj_files_key(obj, cif_files, inter_pdbs, True)
     return uni_a, uni_b
 
 
@@ -638,30 +681,31 @@ def read_features_to_dict_single_sample(feat_file, feat_dict, key):
         print(f"Error reading {feat_file}")
 
 
-def predict_read_features(pdb_names, feat_dict, feat_files):
+def predict_read_features(pdb_names, feat_dict, feat_files, keys=None):
     # keys = ['A', 'A', 'A', 'A', 'A', 'B', 'B', 'B', 'B', 'C', 'J', 'K']
     for i, pdb in enumerate(pdb_names):
-        key = pdb.split('/')[-1].split('.')[0]
-        key = key.split('_')
-        if key[-1] == 'tr':
-            key = key[0]
+        if keys is None:
+            key = pdb.split('/')[-1].split('.')[0]
+            key = key.split('_')
+            if key[-1] == 'tr':
+                key = key[0]
+            else:
+                key = key[-1]
         else:
-            key = key[-1]
+            key = keys[i]
         if key not in feat_dict:
             feat_dict[key] = dict()
         read_features_to_dict_single_sample(feat_files[i], feat_dict, key)
 
 
-def read_features_to_dict(upd_exist=False, feat_files_path=XL_NEIGHBORS_FILES_PATH, out_path=XL_NEIGHBORS_FEATURE_DICT):
+def read_features_to_dict(feat_dict=None, feat_files_path=XL_NEIGHBORS_FILES_PATH, out_path=XL_NEIGHBORS_FEATURE_DICT):
     """
     Read the output of C++ program xl_neighbor into dictionary of features (uniport, residue -> features)
     Saves dictionary - the input for graph dataset construction.
     :return:
     """
     print("Start reading features into dictionary")
-    if upd_exist:
-        feat_dict = get_xl_neighbors_dict()
-    else:
+    if feat_dict is None:
         feat_dict = {}
     print(f"Number of uniports in dict START: {len(feat_dict)}")
     for i, file in enumerate(os.listdir(feat_files_path)):
@@ -822,7 +866,9 @@ def filter_cif_objects(xl_objects):
     cif_objects = []
     pdb_objects = []
     for obj in xl_objects:
-        pdb = find_pdb_file_from_xl_obj(obj, cif_files, inter_pdbs)
+        pdb = obj.pdb_path
+        if obj.pdb_path == '':
+            pdb = find_pdb_file_from_xl_obj(obj, cif_files, inter_pdbs)
         pdb = pdb.split('/')[-1]
         if pdb.split('.')[-1] == 'cif':
             cif_objects.append(obj)
@@ -843,7 +889,7 @@ def num_of_chains_in_pdb(xl_objects, update=True):
         if obj.uniport_a == obj.uniport_b and obj.pdb_file not in inter_pdbs:
             continue
         if obj.pdb_file not in pdb_chains:
-            pdb_file_name = find_pdb_file_from_xl_obj(obj, cif_files, inter_pdbs)
+            pdb_file_name = obj.pdb_path
             if obj.pdb_file in cif_files:
                 structure = cif_parser.get_structure(pdb_file_name.split('/')[-1], pdb_file_name)
             else:
@@ -873,6 +919,7 @@ def get_xl_residues_list_by_chain(xl_file_name, chain_id):
 
 
 def get_lysine_residues_list(pdb_path, pdb_parser, cif_parser, chain_id):
+    print(pdb_path)
     if pdb_path.split('.')[-1] == 'cif':
         structure = cif_parser.get_structure(pdb_path.split('/')[-1], pdb_path)
     else:
@@ -922,14 +969,14 @@ def upd_obj_res_num_by_offset(obj, xl_offsets, pdb_path):
     pdb_name = pdb_path.split('/')[-1].split('.')[0]
     tmp_pdb_name = pdb_name
     if obj.uniport_a != pdb_name:
-        tmp_pdb_name = pdb_name + "_" + obj.uniport_a
+        tmp_pdb_name = pdb_name + "_" + obj.chain_a
     offset_a = xl_offsets[tmp_pdb_name]
     if offset_a != INVALID_OFFSET:
         obj.res_num_a = str(int(obj.res_num_a) - offset_a)
-    if obj.uniport_a == obj.uniport_b:
+    if obj.chain_a == obj.chain_b:
         offset_b = offset_a
     else:
-        tmp_pdb_name = pdb_name + "_" + obj.uniport_b
+        tmp_pdb_name = pdb_name + "_" + obj.chain_b
         offset_b = xl_offsets[tmp_pdb_name]
     if offset_b != INVALID_OFFSET:
         obj.res_num_b = str(int(obj.res_num_b) - offset_b)
@@ -951,14 +998,16 @@ def create_xl_numbering_offset_dict(xl_objects, cif_files=None, inter_pdbs=None)
     for obj in xl_objects:
         if obj.res_num_a == '-1' or obj.res_num_b == '-1':
             continue
-        pdb_path = find_pdb_file_from_xl_obj(obj, cif_files, inter_pdbs=inter_pdbs)
+        pdb_path = obj.pdb_path
+        if pdb_path == '':
+            pdb_path = find_pdb_file_from_xl_obj(obj, cif_files, inter_pdbs=inter_pdbs)
         pdb_name = pdb_path.split('/')[-1].split('.')[0]
         if obj.uniport_a != pdb_name:
             pref, suff = pdb_path.split('.')
-            pdb_path_tmp = f"{pref}_{obj.uniport_a}.{suff}"
+            pdb_path_tmp = f"{pref}_{obj.chain_a}.{suff}"
             find_numbering_offset_single_chain(xl_offsets, pdb_path_tmp, pdb_name, pdb_parser, cif_parser)
-            if obj.uniport_a != obj.uniport_b:
-                pdb_path_tmp = f"{pref}_{obj.uniport_b}.{suff}"
+            if obj.chain_a != obj.chain_b:
+                pdb_path_tmp = f"{pref}_{obj.chain_b}.{suff}"
                 find_numbering_offset_single_chain(xl_offsets, pdb_path_tmp, pdb_name, pdb_parser,cif_parser)
         else:
             find_numbering_offset_single_chain(xl_offsets, pdb_path, pdb_name, pdb_parser, cif_parser)
@@ -978,14 +1027,14 @@ def filter_objects_from_list_by_pdb(xl_objects, inter_pdbs, filter_pdbs=None):
         filter_pdbs = {'1UJZ': {'A', 'B'}, '2BBM': {'A', 'B'}, '3WYO': {'A', 'B', 'C', 'D'}, '6JXD': {'E', 'F', 'A', 'B', 'C', 'D'},
                        '6NR8': {'L', 'P', 'O', 'J', 'K', 'H', 'E', 'G', 'M', 'N', 'D', 'B'}, '7BYI': {'A', 'B'}}
     for obj in xl_objects:
-        pdb_file = find_pdb_file_from_xl_obj(obj, cif_files, inter_pdbs)
+        pdb_file = obj.pdb_path
         if pdb_file is not None:
             pdb_name = pdb_file.split('/')[-1].split('.')[0]
             if pdb_name[:3] == 'pdb':
                 pdb_name = pdb_name[3:]
             pdb_name = pdb_name.upper()
             if pdb_name in filter_pdbs:
-                if obj.uniport_a != obj.uniport_b and obj.uniport_a in filter_pdbs[pdb_name] and obj.uniport_b in filter_pdbs[pdb_name]:
+                if obj.chain_a != obj.chain_b and obj.chain_a in filter_pdbs[pdb_name] and obj.chain_b in filter_pdbs[pdb_name]:
                     continue
             filtered.append(obj)
     print(f"start length: {len(xl_objects)}")
@@ -1031,7 +1080,120 @@ def create_dimers_dict(xl_objects, uni_chain_dict):
     general_utils.save_obj(dimer_dict, 'dimers_in_pdb_dict')
     return dimer_dict
 
-# xl_list = general_utils.load_obj('xl_no_dup_all_cols')
-# get_pdb_xl_known_structures(xl_list)
-# copy_wrong_dir_models()
-# read_features_to_dict()
+
+def get_chain_by_chain_id(chains, chain_id):
+    i = 0
+    chain_res = 0
+    while i < len(chains) and chain_res == 0:
+        chain = chains[i]
+        if chain.id == chain_id:
+            chain_res = chain
+        i += 1
+    return chain_res
+
+
+def get_seq_from_af_pdb(chain):
+    seq = [seq1(aa.resname).lower() for aa in chain]
+    return seq
+
+
+def get_seq_from_chain(chain):
+    seq = []
+    prev_idx = 0
+    for aa in chain:
+        diff = int(aa.id[1]) - prev_idx
+        if diff > 1:
+            seq += ['_'] * (diff - 1)
+        seq.append(seq1(aa.resname).lower())
+        prev_idx = int(aa.id[1])
+    return seq
+
+
+def get_sequences_for_obj(obj, chains, seq_dict):
+    if obj.chain_a not in seq_dict:
+        chain_a = get_chain_by_chain_id(chains, obj.chain_a)
+        if obj.pdb_path[-3:] == 'pdb':
+            seq_a = get_seq_from_af_pdb(chain_a)
+        else:
+            seq_a = get_seq_from_chain(chain_a)
+        seq_dict[obj.chain_a] = seq_a
+    else:
+        seq_a = seq_dict[obj.chain_a]
+    if obj.chain_a == obj.chain_b:
+        return seq_a, seq_a
+    if obj.chain_b not in seq_dict:
+        chain_b = get_chain_by_chain_id(chains, obj.chain_b)
+        seq_b = get_seq_from_chain(chain_b)
+    else:
+        seq_b = seq_dict[obj.chain_b]
+    return seq_a, seq_b
+
+def create_scwrl_mutation_files(res_num, chain_id, closest_res, pdb_path, seq, out_dir):
+    pdb_name = pdb_path.split('/')[-1].split('.')[0].split('_')[0]
+    new_out_dir = f"{out_dir}{pdb_name}/{chain_id}/{res_num}/"
+    print(new_out_dir)
+    if os.path.isdir(new_out_dir):
+        return new_out_dir
+    os.makedirs(new_out_dir)
+    seq[int(res_num) - 1] = seq[int(res_num) - 1].upper()
+    for c in closest_res:
+        seq[c[0] - 1] = seq[c[0] - 1].upper()  # to apply scwrl on these residues
+    for i, c in enumerate(closest_res):
+        for aa in AA_LETTERS:
+            old_aa = c[1]
+            if old_aa != aa:
+                new_seq = copy.deepcopy(seq)
+                new_seq[c[0] - 1] = aa
+                seq_path = new_out_dir + str(c[0]) + '_' + old_aa + '_' + aa + '.txt'
+                with open(seq_path, 'w') as f:
+                    new_seq = "".join(new_seq)
+                    new_seq = new_seq.replace('_', '')
+                    f.write(new_seq)
+                    f.close()
+                new_pdb = new_out_dir + str(c[0]) + '_' + old_aa + '_' + aa + '.pdb'
+                command = SCWRL_SCRIPT + f"-i {pdb_path} -o {new_pdb} -s {seq_path}"
+                subprocess.run(command, shell=True)
+    return new_out_dir
+
+
+def create_dssp_files_from_list(to_create):
+    for f in to_create:
+        if not os.path.isfile(f + '.dssp'):
+            dssp_dict_from_pdb_file(f, DSSP='/cs/staff/dina/software/Staccato/mkdssps')
+
+def create_dssp_files(xl_objects):
+    to_create = set()
+    for obj in xl_objects:
+        if obj.pdb_path[-3:] == 'pdb':
+            to_create.add(obj.pdb_path)
+        else:
+            pdb_pref, suff = obj.pdb_path.split('.')
+            to_create.add(pdb_pref + '_' + obj.chain_a + '.' + suff)
+            to_create.add(pdb_pref + '_' + obj.chain_b + '.' + suff)
+    create_dssp_files_from_list(to_create)
+
+
+
+def create_fasta_from_pdb(pdb_path):
+    pref, _ = pdb_path.split('.')
+    fasta_path = f"{FASTA_PATH}{pref.split('/')[-1]}.fasta"
+    if not os.path.isfile(fasta_path):
+        cmd = f"{PDB_2_FASTA} {pdb_path} | tee {fasta_path}"
+        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE).communicate()
+    return fasta_path
+
+def check_af_multimer(xl_objects):
+    xl_objects = [obj for obj in xl_objects if obj.chain_a != obj.chain_b]
+    couples = dict()
+    for obj in xl_objects:
+        if (obj.pdb_path, obj.chain_a, obj.chain_b) in couples or (obj.pdb_path, obj.chain_b, obj.chain_a) in couples:
+            continue
+        pref, suff = obj.pdb_path.split('.')
+        pdb_a = f"{pref}_{obj.chain_a}.{suff}"
+        pdb_b = f"{pref}_{obj.chain_b}.{suff}"
+        fasta_a = create_fasta_from_pdb(pdb_a)
+        fasta_b = create_fasta_from_pdb(pdb_b)
+        merged_fasta = alpha_fold_files.merge_fastas_to_af_multimer(fasta_a, fasta_b, FASTA_PATH)
+        couples[(obj.pdb_path, obj.chain_a, obj.chain_b)] = merged_fasta
+    general_utils.save_obj(couples, "multimer_fastas_by_objects")
+
